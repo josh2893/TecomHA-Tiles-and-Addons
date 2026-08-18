@@ -339,8 +339,10 @@ class TecomAlarmTile extends TecomTileBase {
         && Number(eventArea) !== Number(myArea)) {
       return;
     }
+    // Prefer the message the integration composed; it names the specific
+    // action (Arm / Force arm / Arm home) rather than assuming a plain arm.
     const who = data.object_name || (data.object ? `object ${data.object}` : 'an input');
-    this._refusalMessage = `Arm refused: ${who} unsealed`;
+    this._refusalMessage = data.message || `Arm refused: ${who} unsealed`;
     this._render();
     if (this._refusalTimer) clearTimeout(this._refusalTimer);
     this._refusalTimer = setTimeout(() => {
