@@ -210,7 +210,7 @@ The line adapts to what the event was:
 | Event | Shown as |
 |---|---|
 | Card granted, user known | the user's name |
-| Card granted, names not synced | `User 2307` |
+| Card granted, names not synced | `User 1041` |
 | Panel opened the door itself | `System` |
 | Exit button | `Exit button` |
 | Door forced | `Forced` |

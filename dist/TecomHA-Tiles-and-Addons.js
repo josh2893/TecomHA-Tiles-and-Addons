@@ -330,6 +330,15 @@ class TecomAlarmTile extends TecomTileBase {
 
   _onControlFailed(ev) {
     const data = ev?.data || {};
+    // The refusal is area-scoped. Without this check every alarm tile on the
+    // dashboard would show a refusal raised against one area.
+    const eventArea = data.area;
+    const myArea = this._hass?.states?.[this._config?.entity]?.attributes?.area;
+    if (eventArea !== undefined && eventArea !== null
+        && myArea !== undefined && myArea !== null
+        && Number(eventArea) !== Number(myArea)) {
+      return;
+    }
     const who = data.object_name || (data.object ? `object ${data.object}` : 'an input');
     this._refusalMessage = `Arm refused: ${who} unsealed`;
     this._render();
