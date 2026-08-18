@@ -1,6 +1,6 @@
 {
-  "name": "Tecom ChallengerPlus Tiles",
-  "filename": "tecom_control_tiles.js",
+  "name": "TecomHA Tiles and Addons",
+  "filename": "TecomHA-Tiles-and-Addons.js",
   "render_readme": true,
   "homeassistant": "2024.4.0"
 }
