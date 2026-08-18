@@ -14,7 +14,12 @@ class TecomTileBase extends HTMLElement {
   }
 
   set hass(hass) {
+    const first = !this._hass;
     this._hass = hass;
+    // Subclasses may need a connection before they can subscribe to events.
+    if (first && typeof this._onHassFirstSet === 'function') {
+      this._onHassFirstSet();
+    }
     this._render();
   }
 
@@ -46,6 +51,53 @@ class TecomTileBase extends HTMLElement {
 
   _isUnavailable(stateObj) {
     return !stateObj || ['unavailable', 'unknown'].includes(stateObj.state);
+  }
+
+  // Compact "5m ago" style age. Event entities hold an ISO timestamp of the
+  // last event as their state, so this turns that into something readable.
+  _relativeTime(iso) {
+    const then = Date.parse(iso);
+    if (Number.isNaN(then)) return '';
+    const secs = Math.floor((Date.now() - then) / 1000);
+    if (secs < 0) return 'just now';
+    if (secs < 60) return 'just now';
+    const mins = Math.floor(secs / 60);
+    if (mins < 60) return `${mins}m ago`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.floor(hours / 24);
+    return `${days}d ago`;
+  }
+
+  // Summarise a door access event entity: who last badged, and how long ago.
+  // Returns null when the entity is missing or has not fired yet.
+  _lastAccess(accessObj, opts = {}) {
+    if (!accessObj || ['unavailable', 'unknown', ''].includes(String(accessObj.state ?? ''))) {
+      return null;
+    }
+    const attrs = accessObj.attributes || {};
+    const type = attrs.event_type;
+    // A null user means the panel opened the door itself rather than a
+    // credential being presented, e.g. a macro-driven unlock. Such an event
+    // often lands a second after a real card read, so fall back to the last
+    // access that did carry a credential rather than showing "System".
+    let who;
+    if (attrs.user_name || attrs.user) {
+      who = attrs.user_name || `User ${attrs.user}`;
+    } else if (attrs.last_user_name || attrs.last_user) {
+      who = `${attrs.last_user_name || `User ${attrs.last_user}`}${opts.stale_suffix || ''}`;
+    } else {
+      who = opts.system_label || 'System';
+    }
+    if (type === 'access_granted_egress') {
+      who = opts.egress_label || 'Exit button';
+    } else if (type === 'door_forced') {
+      who = opts.forced_label || 'Forced';
+    } else if (type === 'door_open_too_long') {
+      who = opts.too_long_label || 'Open too long';
+    }
+    const age = this._relativeTime(accessObj.state);
+    return { who, age, type };
   }
 
   _iconHtml(icon) {
@@ -240,6 +292,76 @@ class TecomAlarmTile extends TecomTileBase {
     };
   }
 
+  // A normal (non-forced) arm can be refused by the panel when an input is
+  // unsealed. The integration fires tecom_challengerplus_control_failed with
+  // the offending input, so the tile can say why instead of appearing to do
+  // nothing. Without this, a refused arm looks like an unresponsive button.
+  connectedCallback() {
+    this._subscribeRefusals();
+  }
+
+  _onHassFirstSet() {
+    this._subscribeRefusals();
+  }
+
+  disconnectedCallback() {
+    if (this._unsubRefusals) {
+      this._unsubRefusals();
+      this._unsubRefusals = undefined;
+    }
+    if (this._refusalTimer) {
+      clearTimeout(this._refusalTimer);
+      this._refusalTimer = undefined;
+    }
+  }
+
+  async _subscribeRefusals() {
+    if (this._unsubRefusals || !this._hass?.connection) return;
+    try {
+      this._unsubRefusals = await this._hass.connection.subscribeEvents(
+        (ev) => this._onControlFailed(ev),
+        'tecom_challengerplus_control_failed',
+      );
+    } catch (err) {
+      // Non-fatal: the tile still works, it just cannot explain refusals.
+      this._unsubRefusals = undefined;
+    }
+  }
+
+  _onControlFailed(ev) {
+    const data = ev?.data || {};
+    const who = data.object_name || (data.object ? `object ${data.object}` : 'an input');
+    this._refusalMessage = `Arm refused: ${who} unsealed`;
+    this._render();
+    if (this._refusalTimer) clearTimeout(this._refusalTimer);
+    this._refusalTimer = setTimeout(() => {
+      this._refusalMessage = undefined;
+      this._refusalTimer = undefined;
+      this._render();
+    }, this._config?.refusal_message_seconds
+      ? this._config.refusal_message_seconds * 1000
+      : 8000);
+  }
+
+  // HA advertises supported arm modes as a bitmask. ARM_CUSTOM_BYPASS is bit 4
+  // (16), which the integration maps to the panel's force arm.
+  _supportsForceArm(stateObj) {
+    const features = Number(stateObj?.attributes?.supported_features ?? 0);
+    return (features & 16) === 16;
+  }
+
+  // Points that put the area into alarm, exposed by the integration so the tile
+  // can show the cause rather than just "Triggered".
+  _alarmCause(stateObj) {
+    const names = stateObj?.attributes?.alarm_input_names;
+    if (Array.isArray(names) && names.length) return names.join(', ');
+    const nums = stateObj?.attributes?.alarm_inputs;
+    if (Array.isArray(nums) && nums.length) {
+      return nums.map((n) => `Input ${n}`).join(', ');
+    }
+    return '';
+  }
+
   _alarmMeta(stateObj) {
     const state = stateObj?.state;
     switch (state) {
@@ -271,9 +393,19 @@ class TecomAlarmTile extends TecomTileBase {
     const name = this._computeName(stateObj, 'Alarm');
     const showButtons = this._config.show_buttons !== false;
 
-    const secondary = unavailable
-      ? 'Entity unavailable'
-      : (this._config.subtitle || 'Tap for more info');
+    // A refused arm is transient, so it takes priority over the usual subtitle
+    // for a few seconds; otherwise show what tripped the alarm when triggered.
+    const cause = this._alarmCause(stateObj);
+    let secondary;
+    if (unavailable) {
+      secondary = 'Entity unavailable';
+    } else if (this._refusalMessage) {
+      secondary = this._refusalMessage;
+    } else if (stateObj?.state === 'triggered' && cause) {
+      secondary = cause;
+    } else {
+      secondary = this._config.subtitle || 'Tap for more info';
+    }
 
     let footer = `<span class="pill ${meta.accent}">${meta.label}</span>`;
 
@@ -281,6 +413,12 @@ class TecomAlarmTile extends TecomTileBase {
       const buttons = [];
       buttons.push(`<button type="button" class="chip" data-action="arm_home">${this._config.arm_home_label || 'Home'}</button>`);
       buttons.push(`<button type="button" class="chip" data-action="arm_away">${this._config.arm_away_label || 'Away'}</button>`);
+      // Force arm is a separate panel action: it arms regardless of unsealed
+      // inputs, where plain Away validates first and is refused if a door is
+      // open. Shown only when the entity advertises custom bypass support.
+      if (this._config.show_force_arm !== false && this._supportsForceArm(stateObj)) {
+        buttons.push(`<button type="button" class="chip" data-action="arm_force">${this._config.force_arm_label || 'Force'}</button>`);
+      }
       buttons.push(`<button type="button" class="chip warn" data-action="disarm">${this._config.disarm_label || 'Disarm'}</button>`);
       footer += buttons.join('');
     }
@@ -303,6 +441,8 @@ class TecomAlarmTile extends TecomTileBase {
           this._callService('alarm_control_panel', 'alarm_arm_home', { entity_id: this._config.entity });
         } else if (action === 'arm_away') {
           this._callService('alarm_control_panel', 'alarm_arm_away', { entity_id: this._config.entity });
+        } else if (action === 'arm_force') {
+          this._callService('alarm_control_panel', 'alarm_arm_custom_bypass', { entity_id: this._config.entity });
         } else if (action === 'disarm') {
           this._callService('alarm_control_panel', 'alarm_disarm', { entity_id: this._config.entity });
         }
@@ -312,11 +452,39 @@ class TecomAlarmTile extends TecomTileBase {
 }
 
 class TecomDoorTile extends TecomTileBase {
+  // The "last access" line shows a relative age. Home Assistant only pushes a
+  // re-render when a state changes, so without a tick the age would freeze at
+  // whatever it read when the event arrived.
+  connectedCallback() {
+    this._startAgeTicker();
+  }
+
+  disconnectedCallback() {
+    this._stopAgeTicker();
+  }
+
+  _startAgeTicker() {
+    if (this._ageTimer) return;
+    this._ageTimer = setInterval(() => {
+      if (this._config?.access_entity && this._config.show_last_access !== false) {
+        this._render();
+      }
+    }, 30000);
+  }
+
+  _stopAgeTicker() {
+    if (this._ageTimer) {
+      clearInterval(this._ageTimer);
+      this._ageTimer = undefined;
+    }
+  }
+
   static getStubConfig() {
     return {
       entity: 'lock.example_door',
       name: 'Door',
       reed_entity: 'binary_sensor.example_door_contact',
+      access_entity: 'event.example_door_access',
     };
   }
 
@@ -429,6 +597,13 @@ class TecomDoorTile extends TecomTileBase {
     const lockObj = this._hass?.states?.[this._config.entity];
     const reedObj = this._config.reed_entity ? this._hass?.states?.[this._config.reed_entity] : null;
     const timezoneObj = this._config.timezone_entity ? this._hass?.states?.[this._config.timezone_entity] : null;
+    const accessObj = this._config.access_entity ? this._hass?.states?.[this._config.access_entity] : null;
+    const lastAccess = this._lastAccess(accessObj, {
+      system_label: this._config.system_user_label,
+      egress_label: this._config.egress_label,
+      forced_label: this._config.forced_label,
+      too_long_label: this._config.too_long_label,
+    });
     const timezoneMeta = this._buildScheduleMeta(timezoneObj, {
       active_state: this._config.timezone_active_state,
       active_label: this._config.timezone_active_label || 'Running',
@@ -455,6 +630,13 @@ class TecomDoorTile extends TecomTileBase {
       secondaryParts.push(`${timezoneMeta.pillPrefix}: ${timezoneMeta.label}`);
     }
 
+    if (!unavailable && lastAccess && this._config.show_last_access !== false) {
+      const label = this._config.last_access_label || 'Last';
+      secondaryParts.push(
+        lastAccess.age ? `${label}: ${lastAccess.who} (${lastAccess.age})` : `${label}: ${lastAccess.who}`,
+      );
+    }
+
     let footer = '';
     if (this._config.reed_entity) {
       footer += `<span class="pill ${meta.contactAccent}">Reed ${meta.contactLabel}</span>`;
@@ -465,6 +647,16 @@ class TecomDoorTile extends TecomTileBase {
     }
     if (!unavailable && showButton) {
       footer += `<button type="button" class="chip primary" data-action="open">${openLabel}</button>`;
+    }
+    // Lock and unlock latch the door until changed, which is distinct from the
+    // momentary Open above. Off by default so existing dashboards are unchanged.
+    if (!unavailable && this._config.show_lock_buttons) {
+      const locked = String(lockObj?.state ?? '') === 'locked';
+      if (locked) {
+        footer += `<button type="button" class="chip" data-action="unlock">${this._config.unlock_label || 'Unlock'}</button>`;
+      } else {
+        footer += `<button type="button" class="chip" data-action="lock">${this._config.lock_label || 'Lock'}</button>`;
+      }
     }
 
     this._renderCard({
@@ -489,6 +681,20 @@ class TecomDoorTile extends TecomTileBase {
         } else {
           this._callService('lock', 'unlock', { entity_id: this._config.entity });
         }
+      });
+    });
+
+    this.shadowRoot.querySelectorAll('button[data-action="lock"], button[data-action="unlock"]').forEach((btn) => {
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        const service = btn.dataset.action;
+        if (service === 'unlock' && this._config.confirm_unlock) {
+          const ok = window.confirm(
+            this._config.confirm_unlock_message || `Unlock ${name}? It will stay unlocked until locked again.`,
+          );
+          if (!ok) return;
+        }
+        this._callService('lock', service, { entity_id: this._config.entity });
       });
     });
   }
